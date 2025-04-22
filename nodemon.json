@@ -1,0 +1,16 @@
+{
+  "ignore": [
+    "upload/*",
+    "processed/*",
+    "summaries/*",
+    "locks/*",
+    "locks/*.lock"
+  ],
+  "watch": [
+    "server.js",
+    "utils/",
+    "public/",
+    "views/"
+  ],
+  "ext": "js,json,ejs,css"
+}
