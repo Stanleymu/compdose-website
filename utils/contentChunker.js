@@ -131,6 +131,52 @@ class ContentChunker {
 
     return processedChunks;
   }
+
+  // Smart chunking utilities
+  /**
+   * Split text into logical sections by headers or paragraphs.
+   */
+  static splitBySections(text) {
+    const headerRegex = /(?=^#{1,6}\s+)/m;
+    const parts = text.split(headerRegex).map(s => s.trim()).filter(Boolean);
+    if (parts.length > 1) return parts;
+    return text.split(/\r?\n\s*\r?\n+/).map(s => s.trim()).filter(Boolean);
+  }
+
+  /**
+   * Create intelligent chunks from sections with overlap.
+   */
+  static createIntelligentChunks(sections, chunkSize = DEFAULT_CHUNK_SIZE, overlapSentences = DEFAULT_CHUNK_OVERLAP) {
+    const chunks = [];
+    const joiner = '\n\n';
+    let buffer = '';
+    let prevOverlap = '';
+    for (const sec of sections) {
+      const section = sec.trim();
+      if (!section) continue;
+      const candidate = buffer ? buffer + joiner + section : section;
+      if (candidate.length <= chunkSize) {
+        buffer = candidate;
+      } else {
+        if (buffer) {
+          chunks.push(buffer);
+          const sentences = buffer.split(/(?<=[.!?:])\s+/);
+          prevOverlap = overlapSentences > 0 ? sentences.slice(-overlapSentences).join(' ') : '';
+        }
+        buffer = prevOverlap ? prevOverlap + joiner + section : section;
+      }
+    }
+    if (buffer) chunks.push(buffer);
+    return chunks;
+  }
+
+  /**
+   * Orchestrate section-based chunking and intelligent grouping.
+   */
+  static splitIntoChunks(text, chunkSize = DEFAULT_CHUNK_SIZE, overlapSentences = DEFAULT_CHUNK_OVERLAP) {
+    const sections = this.splitBySections(text);
+    return this.createIntelligentChunks(sections, chunkSize, overlapSentences);
+  }
 }
 
 module.exports = ContentChunker;

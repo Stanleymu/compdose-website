@@ -32,8 +32,12 @@ module.exports = (app, { summaryDir, processedDir }) => {
         console.log(`[${new Date().toISOString()}] [summarizer] Dropping header: ${paras[0].slice(0,50).replace(/\n/g, ' ')}...`);
         rawText = paras.slice(1).join('\n\n');
       }
-      const chunks = ContentChunker.splitContent(rawText);
-      console.log(`[${new Date().toISOString()}] [summarizer] Split into ${chunks.length} chunks`);
+      // Choose chunker based on env flag
+      const useSmartChunker = process.env.USE_SMART_CHUNKER === 'true';
+      const chunks = useSmartChunker
+        ? ContentChunker.splitIntoChunks(rawText)
+        : ContentChunker.splitContent(rawText);
+      console.log(`[${new Date().toISOString()}] [summarizer] Using ${useSmartChunker ? 'smart' : 'default'} chunker, split into ${chunks.length} chunks`);
       // Debug: log each chunk's length and preview
       chunks.forEach((chunk, i) => {
         console.log(`[chunk debug] ${i+1}/${chunks.length}: ${chunk.length} chars; preview: ${chunk.slice(0,100).replace(/\n/g, ' ')}`);
@@ -108,7 +112,7 @@ module.exports = (app, { summaryDir, processedDir }) => {
               {
                 model: process.env.PERPLEXITY_MODEL,
                 messages: [
-                  { role: 'system', content: `Summarize chunk ${idx+1} of ${chunks.length}. Provide a concise summary focusing on core content, omitting metadata and addresses.` },
+                  { role: 'system', content: `You are an expert summarizer. Summarize chunk ${idx+1} of ${chunks.length} using only the provided text. Provide a concise summary focusing on core content, omitting metadata and addresses. Do not introduce external information, examples, or citations.` },
                   { role: 'user', content: chunk }
                 ],
                 max_tokens: Number(process.env.PERPLEXITY_MAX_TOKENS),
@@ -155,6 +159,9 @@ module.exports = (app, { summaryDir, processedDir }) => {
         };
       });
 
+      // Determine consolidation strategy
+      const useHierarchical = process.env.USE_HIERARCHICAL === 'true';
+
       // Final refine step with skip for small chunk counts
       let finalSummary = '';
       if (useMock) {
@@ -163,6 +170,57 @@ module.exports = (app, { summaryDir, processedDir }) => {
       } else if (chunks.length <= 2) {
         console.log(`[${new Date().toISOString()}] [summarizer] Skipping final refine for ${chunks.length} chunks`);
         finalSummary = miniSummaries.join(' ');
+      } else if (useHierarchical) {
+        console.log(`[${new Date().toISOString()}] [summarizer] Using hierarchical summarization`);
+        try {
+          const batchSize = parseInt(process.env.HIERARCHY_BATCH_SIZE, 10) || 2;
+          const intermediateSummaries = [];
+          for (let i = 0; i < miniSummaries.length; i += batchSize) {
+            const group = miniSummaries.slice(i, i + batchSize);
+            const groupContent = group.join('\n\n---\n\n');
+            const resp = await axios.post(
+              process.env.PERPLEXITY_ENDPOINT,
+              {
+                model: process.env.PERPLEXITY_MODEL,
+                messages: [
+                  { role: 'system', content: 'You are an expert summarizer. Compile **all bullet points and numeric details** from the following chunk summaries. Organize them under section headings matching the original chunk order. Do not omit or abbreviate any items. Preserve the original level of detail.' },
+                  { role: 'user', content: groupContent }
+                ],
+                max_tokens: Number(process.env.PERPLEXITY_FINAL_MAX_TOKENS || process.env.PERPLEXITY_MAX_TOKENS * 2),
+                temperature: Number(process.env.PERPLEXITY_TEMPERATURE),
+                top_p: Number(process.env.PERPLEXITY_TOP_P),
+                presence_penalty: Number(process.env.PERPLEXITY_PRESENCE_PENALTY),
+                frequency_penalty: Number(process.env.PERPLEXITY_FREQUENCY_PENALTY)
+              },
+              { headers: { Authorization: `Bearer ${process.env.PERPLEXITY_API_KEY}` } }
+            );
+            const choice = resp.data.choices?.[0];
+            intermediateSummaries.push((choice?.message?.content || resp.data.text || '').trim());
+          }
+          // Merge intermediate summaries
+          const finalContent = intermediateSummaries.join('\n\n---\n\n');
+          const finalResp = await axios.post(
+            process.env.PERPLEXITY_ENDPOINT,
+            {
+              model: process.env.PERPLEXITY_MODEL,
+              messages: [
+                { role: 'system', content: 'You are an expert summarizer. Compile **all bullet points and numeric details** from the following intermediate summaries. Organize them under section headings matching the original order. Do not omit or abbreviate any items. Preserve the original level of detail.' },
+                { role: 'user', content: finalContent }
+              ],
+              max_tokens: Number(process.env.PERPLEXITY_FINAL_MAX_TOKENS || process.env.PERPLEXITY_MAX_TOKENS * 2),
+              temperature: Number(process.env.PERPLEXITY_TEMPERATURE),
+              top_p: Number(process.env.PERPLEXITY_TOP_P),
+              presence_penalty: Number(process.env.PERPLEXITY_PRESENCE_PENALTY),
+              frequency_penalty: Number(process.env.PERPLEXITY_FREQUENCY_PENALTY)
+            },
+            { headers: { Authorization: `Bearer ${process.env.PERPLEXITY_API_KEY}` } }
+          );
+          const finalChoice = finalResp.data.choices?.[0];
+          finalSummary = (finalChoice?.message?.content || finalResp.data.text || '').trim();
+        } catch (err) {
+          console.error(`[${new Date().toISOString()}] [summarizer] Error hierarchical summarization:`, err);
+          finalSummary = miniSummaries.join('\n\n');
+        }
       } else {
         console.log(`[${new Date().toISOString()}] [summarizer] Sending final refine request`);
         try {
@@ -173,7 +231,7 @@ module.exports = (app, { summaryDir, processedDir }) => {
             {
               model: process.env.PERPLEXITY_MODEL,
               messages: [
-                { role: 'system', content: 'You are an expert summarizer. Combine the following chunk summaries into one coherent and concise overview. Retain only the core content. Ensure all sentences are complete and do not truncate the summary.' },
+                { role: 'system', content: 'You are an expert summarizer. Combine the following chunk summaries into one coherent overview using only the provided summaries. Do not introduce external information, examples, or citations. Ensure sentences are complete.' },
                 { role: 'user', content: concat }
               ],
               max_tokens: Number(process.env.PERPLEXITY_FINAL_MAX_TOKENS || process.env.PERPLEXITY_MAX_TOKENS * 2),
@@ -184,18 +242,22 @@ module.exports = (app, { summaryDir, processedDir }) => {
             },
             { headers: { Authorization: `Bearer ${process.env.PERPLEXITY_API_KEY}` } }
           );
-          // Check for truncation and append continuation if needed
-          const initialSummary = refine.data.choices?.[0]?.message?.content || refine.data.text || miniSummaries.join('\n\n');
+          // Collect initial summary and finish reason
+          const choice = refine.data.choices?.[0];
+          let initialSummary = choice?.message?.content || refine.data.text || miniSummaries.join('\n\n');
           finalSummary = initialSummary.trim();
-          if (!/[.?!]$/.test(finalSummary)) {
-            console.log(`[${new Date().toISOString()}] [summarizer] Final summary appears truncated, requesting continuation`);
+          let finishReason = choice?.finish_reason;
+          let attempt = 0;
+          // Retry continuation up to 3 times if truncated
+          while ((finishReason === 'length' || !/[.?!]$/.test(finalSummary)) && attempt < 3) {
+            console.log(`[${new Date().toISOString()}] [summarizer] Final summary truncated (reason=${finishReason}), continuation attempt ${attempt+1}`);
             try {
-              const cont = await axios.post(
+              const contResp = await axios.post(
                 process.env.PERPLEXITY_ENDPOINT,
                 {
                   model: process.env.PERPLEXITY_MODEL,
                   messages: [
-                    { role: 'system', content: 'You are an expert summarizer. Continue the summary from where you left off, completing any incomplete sentences and ensure the summary ends with proper punctuation.' },
+                    { role: 'system', content: 'You are an expert summarizer. Continue the summary using only the provided content. Do not add external information, examples, or citations. Complete any incomplete sentences and ensure proper punctuation.' },
                     { role: 'user', content: finalSummary }
                   ],
                   max_tokens: Number(process.env.PERPLEXITY_FINAL_MAX_TOKENS || process.env.PERPLEXITY_MAX_TOKENS * 2),
@@ -206,17 +268,50 @@ module.exports = (app, { summaryDir, processedDir }) => {
                 },
                 { headers: { Authorization: `Bearer ${process.env.PERPLEXITY_API_KEY}` } }
               );
-              const contText = cont.data.choices?.[0]?.message?.content || cont.data.text || '';
+              const contChoice = contResp.data.choices?.[0];
+              const contText = contChoice?.message?.content || contResp.data.text || '';
               finalSummary += ' ' + contText.trim();
-              console.log(`[${new Date().toISOString()}] [summarizer] Appended continuation to final summary`);
+              finishReason = contChoice?.finish_reason;
+              if (finishReason !== 'length' && /[.?!]$/.test(finalSummary)) break;
             } catch (e) {
-              console.error(`[${new Date().toISOString()}] [summarizer] Error on summary continuation:`, e);
+              console.error(`[${new Date().toISOString()}] [summarizer] Error during continuation attempt:`, e);
+              break;
             }
+            attempt++;
           }
           console.log(`[${new Date().toISOString()}] [summarizer] Received final summary`);
         } catch (err) {
           console.error(`[${new Date().toISOString()}] [summarizer] Error refining summary:`, err);
           finalSummary = miniSummaries.join('\n\n');
+        }
+      }
+
+      // Final polish pass for cohesion without removing any content
+      if (!useMock) {
+        console.log(`[${new Date().toISOString()}] [summarizer] Polishing summary for flow without removing content`);
+        try {
+          const polishResp = await axios.post(
+            process.env.PERPLEXITY_ENDPOINT,
+            {
+              model: process.env.PERPLEXITY_MODEL,
+              messages: [
+                { role: 'system', content: 'You are an expert summarizer. Rewrite the following summary to improve cohesion and flow. Do not remove or shorten any content; preserve all information exactly. Only adjust phrasing.' },
+                { role: 'user', content: finalSummary }
+              ],
+              max_tokens: Number(process.env.PERPLEXITY_FINAL_MAX_TOKENS || process.env.PERPLEXITY_MAX_TOKENS * 2),
+              temperature: Number(process.env.PERPLEXITY_TEMPERATURE),
+              top_p: Number(process.env.PERPLEXITY_TOP_P),
+              presence_penalty: Number(process.env.PERPLEXITY_PRESENCE_PENALTY),
+              frequency_penalty: Number(process.env.PERPLEXITY_FREQUENCY_PENALTY)
+            },
+            { headers: { Authorization: `Bearer ${process.env.PERPLEXITY_API_KEY}` } }
+          );
+          const polishChoice = polishResp.data.choices?.[0];
+          if (polishChoice?.message?.content) {
+            finalSummary = polishChoice.message.content.trim();
+          }
+        } catch (e) {
+          console.error(`[${new Date().toISOString()}] [summarizer] Error during polish pass:`, e);
         }
       }
 
