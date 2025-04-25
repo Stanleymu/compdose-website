@@ -1,6 +1,41 @@
-const DEFAULT_CHUNK_SIZE = parseInt(process.env.PDF_CHUNK_SIZE, 10) || 8000;
-const DEFAULT_CHUNK_OVERLAP = parseInt(process.env.PDF_CHUNK_OVERLAP_SENTENCES, 10) || 0;
+const DEFAULT_CHUNK_SIZE = parseInt(process.env.PDF_CHUNK_SIZE, 10) || 50000;
+const DEFAULT_CHUNK_OVERLAP = parseInt(process.env.PDF_CHUNK_OVERLAP_SENTENCES, 10) || 2;
 const { createHash } = require('crypto');
+const compromise = require('compromise');
+
+// Preprocessing function: regex + NLP
+function hybridPreprocess(text, log = []) {
+  let cleaned = text;
+  // 1. Regex/String pass
+  // Remove Table of Contents
+  cleaned = cleaned.replace(/Table of Contents[\s\S]+?(Section|Article|1\\.|I\\.)/i, '$1');
+  // Remove headers/footers/page numbers
+  cleaned = cleaned.replace(/^Page \d+.*$/gim, (m) => { log.push(`Removed: ${m}`); return ''; });
+  cleaned = cleaned.replace(/^(Confidential|Draft|Sample|—+)$/gim, (m) => { log.push(`Removed: ${m}`); return ''; });
+  cleaned = cleaned.replace(/^\d+\s*$/gm, (m) => { log.push(`Removed: ${m}`); return ''; });
+  cleaned = cleaned.replace(/^\d+\s+of\s+\d+$/gm, (m) => { log.push(`Removed: ${m}`); return ''; });
+  cleaned = cleaned.replace(/This page intentionally left blank/gi, (m) => { log.push(`Removed: ${m}`); return ''; });
+  cleaned = cleaned.replace(/Do not distribute/gi, (m) => { log.push(`Removed: ${m}`); return ''; });
+  // Collapse whitespace
+  cleaned = cleaned.replace(/\n{3,}/g, '\n\n');
+
+  // 2. NLP pass
+  const doc = compromise(cleaned);
+  const sentences = doc.sentences().out('array');
+  // Detect sections/headings (basic: lines in all caps or numbered)
+  const sectionRegex = /^(SECTION|ARTICLE|[A-Z][A-Z\s]+|\d+\.\d+|[IVX]+\.|\d+\))/gm;
+  const sectionMatches = [];
+  let match;
+  while ((match = sectionRegex.exec(cleaned)) !== null) {
+    sectionMatches.push({ index: match.index, text: match[0] });
+    log.push(`Detected section heading: '${match[0]}' at ${match.index}`);
+  }
+  // Flag sentences containing definitions or references
+  const flagged = sentences.filter(s => /means|refers to|as defined in|see section/i.test(s));
+  flagged.forEach(s => log.push(`Flagged for overlap/context: '${s}'`));
+
+  return { cleanedText: cleaned, sentences, sectionMatches, flagged, log };
+}
 
 class ContentChunker {
   /**
@@ -9,85 +44,34 @@ class ContentChunker {
    * @param {number} [chunkSize=DEFAULT_CHUNK_SIZE] - Target chunk size in characters
    * @param {number} [overlapSentences=DEFAULT_CHUNK_OVERLAP] - Number of sentences to overlap between chunks
    */
-  static splitContent(text, chunkSize = DEFAULT_CHUNK_SIZE, overlapSentences = DEFAULT_CHUNK_OVERLAP) {
-    console.log(`[CHUNKER] Hierarchical chunking on text ${text.length} chars`);
-
-    // Dynamic chunk size calculation using geometric mean between min and max chunk counts
-    const minChunkSize = parseInt(process.env.PDF_MIN_CHUNK_SIZE, 10) || 2000;
-    const maxChunkSize = chunkSize;
-    const totalChars = text.length;
-    const rawMinChunks = Math.ceil(totalChars / maxChunkSize);
-    const rawMaxChunks = Math.ceil(totalChars / minChunkSize);
-    // Geometric mean for balanced chunk count
-    const geomChunks = Math.ceil(Math.sqrt(rawMinChunks * rawMaxChunks));
-    // Cap target chunk count by PDF_MAX_CHUNKS env var
-    let targetChunks = Math.min(Math.max(rawMinChunks, geomChunks), rawMaxChunks);
-    if (process.env.PDF_MAX_CHUNKS) {
-      const maxAllowed = parseInt(process.env.PDF_MAX_CHUNKS, 10);
-      if (!isNaN(maxAllowed)) {
-        const oldCount = targetChunks;
-        targetChunks = Math.min(targetChunks, maxAllowed);
-        console.log(`[CHUNKER] Capped chunk count from ${oldCount} to PDF_MAX_CHUNKS=${maxAllowed}`);
-      }
+  static splitContent(text, chunkSize = DEFAULT_CHUNK_SIZE, overlapSentences = DEFAULT_CHUNK_OVERLAP, enablePreprocessing = true, log = []) {
+    let preprocessed = text;
+    let preprocessLog = [];
+    if (enablePreprocessing) {
+      const result = hybridPreprocess(text, preprocessLog);
+      preprocessed = result.cleanedText;
+      log.push(...preprocessLog);
     }
-    const dynamicSize = Math.ceil(totalChars / targetChunks);
-    const finalChunkSize = Math.min(maxChunkSize, Math.max(minChunkSize, dynamicSize));
-    console.log(`[CHUNKER] Dynamic chunkSize ${finalChunkSize} chars aiming for ~${targetChunks} chunks (min=${rawMinChunks}, max=${rawMaxChunks})`);
-    // Override chunkSize for grouping
-    chunkSize = finalChunkSize;
-    // Semantic units for grouping
-    const headerUnits = text.split(/(?=^#{1,3}\s+)/m);
-    const units = headerUnits.length > 1 ? headerUnits : text.split(/\r?\n\s*\r?\n+/);
-
-    // Group units into chunks by dynamic chunkSize
-    const overlapCount = overlapSentences;
+    // For DeepSeek, typically chunk once at a very high token count
+    // But keep chunking logic in case doc is massive
+    const maxChunkSize = chunkSize;
+    const units = preprocessed.split(/\r?\n\s*\r?\n+/);
     const chunks = [];
-    const joiner = '\n\n';
-    let previousOverlap = '';
     let buffer = '';
+    const joiner = '\n\n';
     for (const unit of units) {
       const textUnit = unit.trim();
       if (!textUnit) continue;
       const candidate = buffer ? buffer + joiner + textUnit : textUnit;
-      if (candidate.length <= chunkSize) {
+      if (candidate.length <= maxChunkSize) {
         buffer = candidate;
       } else {
         if (buffer) chunks.push(buffer);
-        const sentences = buffer.split(/(?<=[.!?:])\s+/);
-        previousOverlap = overlapCount > 0 ? sentences.slice(-overlapCount).join(' ') : '';
-        buffer = previousOverlap ? previousOverlap + joiner + textUnit : textUnit;
+        buffer = textUnit;
       }
     }
     if (buffer) chunks.push(buffer);
-    console.log(`[CHUNKER] Created ${chunks.length} chunks with up to ${overlapCount} sentence overlap`);
-    // Fallback: if too many chunks, slice uniformly to meet targetChunks
-    if (typeof targetChunks !== 'undefined' && chunks.length > targetChunks) {
-      console.warn(`[CHUNKER] Chunk count ${chunks.length} exceeds targetChunks ${targetChunks}, falling back to sentence-aware slicing`);
-      // Sentence-aware uniform slicing
-      const sentences = text.match(/[^.!?]+[.!?]+(?:\s+|$)/g) || [];
-      const uniform = [];
-      let bufferSentence = '';
-      for (const sentence of sentences) {
-        if ((bufferSentence + sentence).length <= chunkSize) {
-          bufferSentence += sentence;
-        } else {
-          if (bufferSentence) uniform.push(bufferSentence);
-          bufferSentence = sentence;
-        }
-      }
-      if (bufferSentence) uniform.push(bufferSentence);
-      console.log(`[CHUNKER] Sentence-aware slicing produced ${uniform.length} chunks`);
-      // Merge overflow chunks to respect targetChunks
-      if (uniform.length > targetChunks) {
-        console.warn(`[CHUNKER] Merging last chunks to respect targetChunks ${targetChunks}`);
-        while (uniform.length > targetChunks) {
-          const last = uniform.pop();
-          uniform[uniform.length - 1] += ' ' + last;
-        }
-        console.log(`[CHUNKER] After merging, produced ${uniform.length} chunks`);
-      }
-      return uniform;
-    }
+    log.push(`[CHUNKER] Created ${chunks.length} chunks with maxChunkSize ${maxChunkSize}`);
     return chunks;
   }
 
@@ -177,6 +161,8 @@ class ContentChunker {
     const sections = this.splitBySections(text);
     return this.createIntelligentChunks(sections, chunkSize, overlapSentences);
   }
+
+  static hybridPreprocess = hybridPreprocess;
 }
 
 module.exports = ContentChunker;
