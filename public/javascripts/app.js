@@ -74,6 +74,13 @@ window.addEventListener('DOMContentLoaded', () => {
 
       // Summary text: support legacy object entries
       const raw = (() => {
+        if (summary.summary) {
+          if (typeof summary.summary.executive_summary === 'string' && summary.summary.executive_summary) {
+            return summary.summary.executive_summary;
+          }
+          return JSON.stringify(summary.summary, null, 2);
+        }
+        // Legacy fallback
         if (typeof summary.finalSummary === 'string' && summary.finalSummary) {
           return summary.finalSummary;
         }
@@ -133,52 +140,8 @@ window.addEventListener('DOMContentLoaded', () => {
         e.preventDefault();
         const lastFocused = document.activeElement;
         const filename = btn.dataset.filename;
-        const modalEl = document.getElementById('summaryModal');
-        // trap focus inside modal
-        modalEl.addEventListener('shown.bs.modal', () => {
-          const closeBtn = modalEl.querySelector('.btn-close');
-          if (closeBtn) closeBtn.focus();
-        }, { once: true });
-        modalEl.addEventListener('hidden.bs.modal', () => {
-          if (lastFocused) lastFocused.focus();
-        }, { once: true });
-        const bsModal = new bootstrap.Modal(modalEl);
-        bsModal.show();
-        document.getElementById('summaryModalLabel').textContent = title;
-        const modalBody = document.getElementById('modalSummaryContent');
-        modalBody.innerHTML = `
-          <div class="d-flex justify-content-center align-items-center py-5">
-            <div class="spinner-border text-primary" role="status">
-              <span class="visually-hidden">Loading...</span>
-            </div>
-          </div>
-        `;
-        try {
-          const resp = await fetch('/api/summaries');
-          const list = await resp.json();
-          const data = list.find(item => item.fileName === filename);
-          if (!data) throw new Error('Summary not found');
-          // Extract markdown text from finalSummary or chunk objects
-          let md = '';
-          if (typeof data.finalSummary === 'string' && data.finalSummary) {
-            md = data.finalSummary;
-          } else if (Array.isArray(data.summaries)) {
-            md = data.summaries.map(chunk => {
-              if (typeof chunk === 'string') return chunk;
-              if (chunk.choices && chunk.choices[0] && chunk.choices[0].message?.content) {
-                return chunk.choices[0].message.content;
-              }
-              return '';
-            }).join('\n\n');
-          }
-          const html = marked.parse(md);
-          modalBody.innerHTML = html;
-          // assign IDs to each paragraph for deep-linking
-          modalBody.querySelectorAll('p').forEach((p,i) => p.id = 'para-' + i);
-        } catch (err) {
-          console.error('Modal fetch error:', err);
-          modalBody.innerHTML = `<div class="alert alert-danger">Failed to load summary.</div>`;
-        }
+        const data = summaryList.find(item => item.fileName === filename);
+        showSummaryModal(data);
       });
     });
   }
@@ -321,6 +284,42 @@ window.addEventListener('DOMContentLoaded', () => {
       });
     }, 300);
     searchInput.addEventListener('input', handleSearch);
+  }
+
+  function showSummaryModal(summaryData) {
+    const modalTitle = document.getElementById('summaryModalLabel');
+    const modalContent = document.getElementById('modalSummaryContent');
+    let md = '';
+    // First check for modern format
+    if (summaryData && summaryData.version === "2.0" && summaryData.format === "markdown") {
+      // Modern version 2.0 format
+      md = summaryData.summary;
+      console.log('Using version 2.0 summary format');
+    } 
+    // Legacy format fallbacks in order of preference
+    else if (typeof summaryData === 'string') {
+      md = summaryData;
+      console.log('Using direct string summary');
+    } else if (summaryData && typeof summaryData.summary === 'string') {
+      md = summaryData.summary;
+      console.log('Using summary.summary string');
+    } else if (summaryData && summaryData.summary && typeof summaryData.summary.summary === 'string') {
+      md = summaryData.summary.summary;
+      console.log('Using summary.summary.summary nested structure');
+    } else if (summaryData && typeof summaryData.finalSummary === 'string') {
+      md = summaryData.finalSummary;
+      console.log('Using finalSummary legacy format');
+    } else if (summaryData && summaryData.summary && typeof summaryData.summary.executive_summary === 'string') {
+      md = summaryData.summary.executive_summary;
+      console.log('Using summary.executive_summary legacy format');
+    } else {
+      console.log('No summary found in data:', summaryData);
+      md = 'No summary available.';
+    }
+    modalContent.innerHTML = marked.parse(md);
+    modalTitle.textContent = (summaryData.fileName || 'Summary');
+    const summaryModal = new bootstrap.Modal(document.getElementById('summaryModal'));
+    summaryModal.show();
   }
 });
 

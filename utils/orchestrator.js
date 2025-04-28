@@ -1,113 +1,236 @@
-const fetch = require('node-fetch');
+// Using native fetch (Node 18+)
 const Ajv = require('ajv');
-const pLimit = require('p-limit');
 const ContentChunker = require('./contentChunker');
+require('dotenv').config();
 
 // --- Configuration ---
-const API_URL = 'https://api.perplexity.ai/chat/completions';
+const API_URL = process.env.LLM_API_URL;
 const BEARER_TOKEN = process.env.API_TOKEN;
-const MODEL_NAME = 'sonar';
-const CONCURRENCY = parseInt(process.env.LLM_CONCURRENCY, 10) || 4;
+const MODEL_NAME = process.env.LLM_MODEL_NAME;
 const MAX_RETRIES = 2;
 const SENTINEL = '###END_OF_JSON###';
 
-// --- JSON Schema (simplified stub) ---
+// --- JSON Schema (expanded) ---
 const schema = {
   type: 'object',
   properties: {
-    regulatory_context: { type: 'object' },
-    requirements: { type: 'array' },
-    impact_and_risk: { type: 'array' },
-    ambiguities: { type: 'array' },
+    regulatory_context: {
+      type: 'object',
+      properties: {
+        issuer: { type: 'string' },
+        originalCircular: {
+          type: 'object',
+          properties: {
+            number: { type: 'integer' },
+            issueDate: { type: 'string' },
+            scope: { type: 'string' }
+          },
+          required: ['number','issueDate','scope']
+        },
+        withdrawal: {
+          type: 'object',
+          properties: {
+            circularNumber: { type: 'integer' },
+            effectiveDate: { type: 'string' },
+            issuedBy: { type: 'string' }
+          },
+          required: ['circularNumber','effectiveDate','issuedBy']
+        }
+      },
+      required: ['issuer','originalCircular','withdrawal']
+    },
+    requirements: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          id: { type: 'integer' },
+          description: { type: 'string' },
+          status: { type: 'string' }
+        },
+        required: ['id','description','status']
+      }
+    },
+    impact_and_risk: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          risk: { type: 'string' },
+          impact: { type: 'string' }
+        },
+        required: ['risk','impact']
+      }
+    },
+    ambiguities: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          detail: { type: 'string' }
+        },
+        required: ['detail']
+      }
+    },
     executive_summary: { type: 'string' },
-    key_obligations_table: { type: 'array' },
-    responsibility_matrix: { type: 'array' },
-    visual_aids: { type: 'object' }
+    key_obligations_table: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          obligation: { type: 'string' },
+          description: { type: 'string' }
+        },
+        required: ['obligation','description']
+      }
+    },
+    responsibility_matrix: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          role: { type: 'string' },
+          responsibility: { type: 'string' }
+        },
+        required: ['role','responsibility']
+      }
+    },
+    visual_aids: {
+      type: 'object',
+      properties: {
+        timeline: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              date: { type: 'string' },
+              event: { type: 'string' }
+            },
+            required: ['date','event']
+          }
+        }
+      },
+      required: ['timeline']
+    }
   },
-  required: ['regulatory_context','requirements','executive_summary']
+  required: ['regulatory_context','requirements','impact_and_risk','ambiguities','executive_summary','key_obligations_table','responsibility_matrix','visual_aids']
 };
 const ajv = new Ajv();
 const validateFinal = ajv.compile(schema);
 
-function buildStage1Messages(chunk, idx, total) {
-  return [
-    { role: 'system', content: [
-      'You are a senior compliance officer at a large financial institution.',
-      'Only use the provided chunk content; do not introduce any external information or assumptions.',
-      'Be precise and comprehensive, not just concise.',
-      'When you analyze regulatory text, follow these steps exactly:',
-      '1. Regulatory Context...','2. Decompose Requirements...','3. Interpret Ambiguities...','4. Capture Details...',
-      'Output each section in JSON under keys: context, requirements, ambiguities, details.',
-      `// chunk ${idx+1}/${total}`,
-      SENTINEL
-    ].join(' ')},
-    { role: 'user', content: chunk }
-  ];
-}
-
-function buildStage2Messages(results) {
-  return [
-    { role: 'system', content: [
-      'You are an expert compliance synthesizer.',
-      'Only use the provided chunk-level JSON; do not add or infer any data not present in the inputs.',
-      'Combine the following chunk-level JSON objects into one final JSON matching the schema below:',
-      JSON.stringify(schema, null, 2),
-      'Include every item, do not abbreviate.',
-      SENTINEL
-    ].join('\n')},
-    { role: 'user', content: JSON.stringify(results) }
-  ];
-}
-
 async function callLLM(messages, attempt = 0) {
-  const res = await fetch(API_URL, {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${BEARER_TOKEN}`,
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify({ model: MODEL_NAME, messages, temperature:0.2, top_p:0.9, frequency_penalty:1, max_tokens:1200 })
-  });
-  if (!res.ok) throw new Error(`LLM Error ${res.status}`);
-  let text = (await res.json()).choices[0].message.content || '';
-  if (!text.includes(SENTINEL) && attempt < MAX_RETRIES) {
-    console.warn(`Missing sentinel, retrying attempt ${attempt+1}`);
-    return callLLM(messages, attempt+1);
-  }
-  return text.replace(SENTINEL, '').trim();
-}
-
-async function parseJsonWithRetry(raw, messages, retries = MAX_RETRIES) {
+  console.log(`[orchestrator] callLLM attempt ${attempt+1}, URL: ${API_URL}`);
+  let res;
   try {
-    return JSON.parse(raw);
+    res = await fetch(API_URL, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${BEARER_TOKEN}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({ model: MODEL_NAME, messages, temperature:0.2, top_p:0.9, frequency_penalty:1, max_tokens:1200 })
+    });
   } catch (err) {
-    if (retries > 0) {
-      console.warn('JSON parse failed, retrying...');
-      const fresh = await callLLM(messages);
-      return parseJsonWithRetry(fresh, messages, retries-1);
-    }
-    throw new Error('Failed to parse JSON after retries');
+    console.error(`[orchestrator] fetch error on attempt ${attempt+1}:`, err);
+    throw err;
   }
+  console.log(`[orchestrator] callLLM response status: ${res.status}`);
+  if (!res.ok) {
+    console.error(`[orchestrator] LLM returned error status ${res.status}`);
+    throw new Error(`LLM Error ${res.status}`);
+  }
+  const json = await res.json();
+  console.log(`[orchestrator] raw response:`, JSON.stringify(json, null, 2));
+  const text = json.choices?.[0]?.message?.content || '';
+  console.log(`[orchestrator] extracted text: ${text.slice(0,200)}...`);
+  // Bypass sentinel; return raw trimmed content
+  return text.trim();
 }
 
 async function orchestrateText(text) {
-  const chunks = ContentChunker.splitIntoChunks(text);
-  const limit = pLimit(CONCURRENCY);
-  const promises = chunks.map((c,i) => limit(async () => {
-    const msgs = buildStage1Messages(c, i, chunks.length);
-    const raw = await callLLM(msgs);
-    return parseJsonWithRetry(raw, msgs);
-  }));
-  const chunkResults = await Promise.all(promises);
-
-  const mergeMsgs = buildStage2Messages(chunkResults);
-  const mergedRaw = await callLLM(mergeMsgs);
-  const finalJson = await parseJsonWithRetry(mergedRaw, mergeMsgs);
-
-  if (!validateFinal(finalJson)) {
-    console.error('Final JSON schema errors:', validateFinal.errors);
+  const startTime = new Date();
+  console.log(`[orchestrator] [${startTime.toISOString()}] orchestrateText start`);
+  
+  // Single comprehensive analysis instead of chunking
+  const messages = [
+    { 
+      role: 'system', 
+      content: [
+        'You are an expert regulatory analyst. Analyze the provided document following these steps:',
+        '',
+        '1. Identify the main purpose: Determine what the document aims to achieve.',
+        '',
+        '2. Read carefully: Focus on key sections such as introductions, definitions, and conclusions.',
+        '',
+        '3. Break it down: Analyze the document structure and organization.',
+        '',
+        '4. Identify key points: Extract requirements, restrictions, timelines, and compliance obligations.',
+        '',
+        '5. Write a comprehensive summary using this template:',
+        '',
+        'Title: [Document Name] Summary',
+        '==============================',
+        '',
+        'Overview',
+        '--------',
+        '[Briefly describe the document, including its purpose and scope]',
+        '',
+        'Main Provisions',
+        '---------------',
+        '* [Key provision 1]',
+        '* [Key provision 2]',
+        '* [Key provision 3]',
+        '',
+        'Key Changes (if applicable)',
+        '-------------------------',
+        '[List significant changes from previous versions]',
+        '',
+        'Impact on Organizations and Individuals',
+        '---------------------------------------',
+        '[Describe consequences for non-compliance and strategies for compliance]',
+        '',
+        'Monitoring and Enforcement',
+        '-------------------------',
+        '[Explain how compliance is tracked and enforced]',
+        '',
+        'Conclusion',
+        '----------',
+        '[Summarize importance of understanding this regulation]',
+        '',
+        '6. Format as clean Markdown without code blocks or other formatting artifacts.'
+      ].join('\n') 
+    },
+    { role: 'user', content: text }
+  ];
+  
+  console.log(`[orchestrator] [${new Date().toISOString()}] Calling LLM for comprehensive summary...`);
+  
+  try {
+    var rawSummary = await callLLM(messages);
+    console.log(`[orchestrator] [${new Date().toISOString()}] LLM response received.`);
+  } catch (err) {
+    console.error(`[orchestrator] [${new Date().toISOString()}] Error on LLM call:`, err);
+    throw err;
   }
-  return finalJson;
+  
+  // Clean the markdown output
+  const markdownSummary = rawSummary
+    .replace(/```(?:markdown)?\n?/g, '')
+    .replace(/```/g, '')
+    .trim();
+  
+  // Create the result object with the markdown summary
+  const finalResult = {
+    version: "2.0",
+    format: "markdown",
+    summary: markdownSummary,
+    generatedAt: new Date().toISOString(),
+    sourceLength: text.length
+  };
+  
+  const endTime = new Date();
+  console.log(`[orchestrator] [${endTime.toISOString()}] orchestrateText completed (total duration: ${endTime - startTime}ms)`);
+  return finalResult;
 }
 
 module.exports = { orchestrateText };
