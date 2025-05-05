@@ -2,7 +2,6 @@ const dotenv = require('dotenv');
 const express = require('express');
 const path = require('path');
 const fs = require('fs');
-const multer = require('multer');
 
 // Load environment variables
 dotenv.config();
@@ -27,36 +26,25 @@ app.use((req, res, next) => {
 });
 
 // Configuration directories
-const UPLOAD_DIR = path.join(__dirname, 'upload');
-if (!fs.existsSync(UPLOAD_DIR)) {
-  fs.mkdirSync(UPLOAD_DIR, { recursive: true });
-}
 const SUMMARY_DIR = path.join(__dirname, 'summaries');
-const PROCESSED_DIR = path.join(__dirname, 'processed');
-if (!fs.existsSync(PROCESSED_DIR)) {
-  fs.mkdirSync(PROCESSED_DIR, { recursive: true });
+if (!fs.existsSync(SUMMARY_DIR)) {
+  fs.mkdirSync(SUMMARY_DIR, { recursive: true });
 }
-const upload = multer({ dest: UPLOAD_DIR });
-
-// Upload endpoint using multer
-app.post('/upload', upload.single('file'), (req, res) => {
-  console.log(`[${new Date().toISOString()}] [upload] File saved: ${req.file.path}`);
-  res.json({ fileName: req.file.filename });
-});
 
 // Homepage route
 app.get('/', (req, res) => {
   res.render('index');
 });
 
-// Initialize modular components (to be implemented)
-require('./watcher')(app, { uploadDir: UPLOAD_DIR });
-require('./summarizer')(app, { summaryDir: SUMMARY_DIR, processedDir: PROCESSED_DIR });
+// Initialize only the simplified summarizer without file watching or processing
+require('./summarizer')(app, { summaryDir: SUMMARY_DIR });
 
 // Start server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`Server running on http://localhost:${PORT}`);
+  console.log(`[${new Date().toISOString()}] Server running on http://localhost:${PORT}`);
+  console.log(`[${new Date().toISOString()}] Summary files will be served from: ${SUMMARY_DIR}`);
+  console.log(`[${new Date().toISOString()}] NOTE: External process required for generating summary files`);
 });
 
 module.exports = app;
